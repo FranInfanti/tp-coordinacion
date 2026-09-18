@@ -14,6 +14,7 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 class SumFilter:
+
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
@@ -26,30 +27,35 @@ class SumFilter:
             self.data_output_exchanges.append(data_output_exchange)
         self.amount_by_fruit = {}
 
-    def _process_data(self, fruit, amount):
-        logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
+    def _process_data(self, req_id, fruit, amount):
+        logging.info(f"Process data for req_id={req_id}")
+        self.amount_by_fruit[(req_id, fruit)] = self.amount_by_fruit.get(
+            (req_id, fruit), fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
+    def _process_eof(self, req_id):
+        logging.info(f"Broadcasting data messages for req_id={req_id}")
+
+        for (_req_id, _), final_fruit_item in self.amount_by_fruit.items():
+            if _req_id != req_id:
+                continue
+
             for data_output_exchange in self.data_output_exchanges:
+                logging.info(f"Send to aggregation for req_id={req_id}")
                 data_output_exchange.send(
                     message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
+                        [req_id, final_fruit_item.fruit, final_fruit_item.amount]
                     )
                 )
 
-        logging.info(f"Broadcasting EOF message")
+        logging.info(f"Broadcasting EOF message for req_id={req_id}")
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+            data_output_exchange.send(message_protocol.internal.serialize([req_id]))
 
 
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
+        if len(fields) == 3:
             self._process_data(*fields)
         else:
             self._process_eof(*fields)
