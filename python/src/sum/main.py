@@ -19,39 +19,67 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+
+        self.eof_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{ID}"]
+        )
+
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
 
-    def _process_data(self, req_id, fruit, amount):
-        logging.info(f"Process data for req_id={req_id}")
-        self.amount_by_fruit[(req_id, fruit)] = self.amount_by_fruit.get(
-            (req_id, fruit), fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
-
-    def _process_eof(self, req_id):
-        logging.info(f"Broadcasting data messages for req_id={req_id}")
-
-        for (_req_id, _), final_fruit_item in self.amount_by_fruit.items():
-            if _req_id != req_id:
+        self.eof_exchanges = []
+        for i in range(SUM_AMOUNT):
+            if i == ID:
                 continue
 
-            for data_output_exchange in self.data_output_exchanges:
-                logging.info(f"Send to aggregation for req_id={req_id}")
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [req_id, final_fruit_item.fruit, final_fruit_item.amount]
+            eof_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{i}"]
+            )
+            self.eof_exchanges.append(eof_exchange)
+
+        self.fruit_by_req = {}
+        self.fruit_by_req_lock = threading.Lock()
+
+    def _process_data(self, req_id, fruit, amount):
+        with self.fruit_by_req_lock:
+            logging.info(f"Process data for req_id={req_id}")
+
+            amount_by_fruit = self.fruit_by_req.get(req_id, {})
+            amount_by_fruit[fruit] = amount_by_fruit.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
+
+            self.fruit_by_req[req_id] = amount_by_fruit
+
+    def _process_eof(self, req_id):
+        logging.info(f"Process EOF for req_id={req_id}")
+
+        with self.fruit_by_req_lock:
+            amount_by_fruit = self.fruit_by_req_lock.get(req_id)
+            if not amount_by_fruit:
+                return
+
+            logging.info(f"Broadcast data message for req_id={req_id}")
+            for final_fruit_item in amount_by_fruit.values():
+                for data_output_exchange in self.data_output_exchanges:
+                    data_output_exchange.send(
+                        message_protocol.internal.serialize(
+                            [req_id, final_fruit_item.fruit, final_fruit_item.amount]
+                        )
                     )
-                )
 
-        logging.info(f"Broadcasting EOF message for req_id={req_id}")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([req_id]))
+            logging.info(f"Broadcast EOF message for req_id={req_id}")
+            for data_output_exchange in self.data_output_exchanges:
+                data_output_exchange.send(message_protocol.internal.serialize([req_id]))
 
+            del self.fruit_by_req[req_id]
+
+        for eof_exchange in self.eof_exchanges:
+            eof_exchange.send(message_protocol.internal.serialize([req_id]))
 
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
@@ -62,6 +90,11 @@ class SumFilter:
         ack()
 
     def start(self):
+        threading.Thread(
+            target=self.eof_exchange.start_consuming, 
+            args=(self.process_data_messsage,)
+        ).start()
+
         self.input_queue.start_consuming(self.process_data_messsage)
 
 def main():
@@ -69,7 +102,6 @@ def main():
     sum_filter = SumFilter()
     sum_filter.start()
     return 0
-
 
 if __name__ == "__main__":
     main()

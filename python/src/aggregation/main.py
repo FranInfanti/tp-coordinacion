@@ -13,17 +13,19 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
-
 class AggregationFilter:
 
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
         )
+
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+
         self.fruit_top = {}
+        self.eof_fruit_top = {}
 
     def _process_data(self, req_id, fruit, amount):
         logging.info(f"Processing data message for req_id={req_id}")
@@ -31,9 +33,9 @@ class AggregationFilter:
         fruit_top = self.fruit_top.get(req_id, [])
         for i in range(len(fruit_top)):
             if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+                updated_fruit = fruit_top[i] + fruit_item.FruitItem(fruit, amount)
+                fruit_top.pop(i)
+                bisect.insort(fruit_top, updated_fruit)
                 self.fruit_top[req_id] = fruit_top
                 return
 
@@ -42,6 +44,13 @@ class AggregationFilter:
 
     def _process_eof(self, req_id):
         logging.info(f"Received EOF for req_id={req_id}")
+
+        eof_fruit_top = self.eof_fruit_top.get(req_id, 0) + 1
+        self.eof_fruit_top[req_id] = eof_fruit_top
+        if eof_fruit_top < SUM_AMOUNT:
+            logging.info(f"Still waiting for more data for req_id={req_id}")
+            return
+
         fruit_chunk = list(self.fruit_top.get(req_id, [])[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
@@ -51,13 +60,14 @@ class AggregationFilter:
             )
         )
 
-        logging.info(f"Sending top for req_id={req_id}: {fruit_top}")
+        logging.info(f"Sending top for req_id={req_id}")
 
         self.output_queue.send(message_protocol.internal.serialize([req_id, fruit_top]))
+
         del self.fruit_top[req_id]
+        del self.eof_fruit_top[req_id]
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
@@ -68,13 +78,11 @@ class AggregationFilter:
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
 
-
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
     aggregation_filter.start()
     return 0
-
 
 if __name__ == "__main__":
     main()
