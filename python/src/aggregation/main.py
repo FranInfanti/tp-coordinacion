@@ -67,7 +67,7 @@ class AggregationFilter:
         del self.fruit_top[req_id]
         del self.eof_fruit_top[req_id]
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
@@ -76,7 +76,7 @@ class AggregationFilter:
         ack()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.start_consuming(self.process_message)
 
 def main():
     logging.basicConfig(level=logging.INFO)

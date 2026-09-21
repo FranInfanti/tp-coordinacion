@@ -1,4 +1,5 @@
 import os
+import hashlib
 import logging
 import threading
 
@@ -44,16 +45,27 @@ class SumFilter:
         self.fruit_by_req = {}
         self.fruit_by_req_lock = threading.Lock()
 
-    def _publish_data(self, req_id, amount_by_fruit):
-        logging.info(f"Broadcast data message for req_id={req_id}")
+    def _get_aggregation_node(self, req_id):
+        hash = hashlib.md5(str(req_id).encode()).hexdigest()
+        return int(hash, 16) % AGGREGATION_AMOUNT
 
+    def _send_data(self, req_id, amount_by_fruit):
+        logging.info(f"Sending data message for req_id={req_id}")
+
+        i = self._get_aggregation_node(req_id)
         for final_fruit_item in amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [req_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+            data_output_exchange = self.data_output_exchanges[i]
+            data_output_exchange.send(
+                message_protocol.internal.serialize(
+                    [req_id, final_fruit_item.fruit, final_fruit_item.amount]
                 )
+            )
+
+    def _send_eof(self, req_id, exchanges):
+        logging.info(f"Sending EOF message for req_id={req_id}")
+
+        i = self._get_aggregation_node(req_id)
+        exchanges[i].send(message_protocol.internal.serialize([req_id]))
 
     def _publish_eof(self, req_id, exchanges):
         logging.info(f"Broadcast EOF message for req_id={req_id}")
@@ -79,14 +91,14 @@ class SumFilter:
             if not amount_by_fruit:
                 return
 
-            self._publish_data(req_id, amount_by_fruit)
-            self._publish_eof(req_id, self.data_output_exchanges)
+            self._send_data(req_id, amount_by_fruit)
+            self._send_eof(req_id, self.data_output_exchanges)
 
             del self.fruit_by_req[req_id]
 
         self._publish_eof(req_id, self.eof_exchanges)
 
-    def process_data_messsage(self, message, ack, nack):
+    def process_data_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
@@ -97,10 +109,10 @@ class SumFilter:
     def start(self):
         threading.Thread(
             target=self.eof_exchange.start_consuming, 
-            args=(self.process_data_messsage,)
+            args=(self.process_data_message,)
         ).start()
 
-        self.input_queue.start_consuming(self.process_data_messsage)
+        self.input_queue.start_consuming(self.process_data_message)
 
 def main():
     logging.basicConfig(level=logging.INFO)
