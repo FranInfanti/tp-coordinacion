@@ -68,25 +68,17 @@ class SumFilter:
     def _sigterm_handler(self, signum, frame):
         logging.info("SIGTERM received, proceed with graceful shutdown...")
 
-        # stop consuming from the input queue
         try:
             self.input_queue.stop_consuming()
-        except Exception:
-            pass
-
-        try:
             self.input_queue.close()
         except Exception:
             pass
 
-        try:
-            self.input_exchange.send(
-                message_protocol.internal.serialize([_KILL])
-            )
-        except Exception as error:
-            logging.warning(f"Unable to notify exchange consumer during shutdown: {error}")
+        self.input_exchange.send(
+            message_protocol.internal.serialize([_KILL])
+        )
 
-        if self.exchange_consumer is not None:
+        if self.exchange_consumer:
             self.exchange_consumer.join(timeout=_TIMEOUT)
             if self.exchange_consumer.is_alive():
                 logging.warning("Exchange consumer did not stop before timeout")
@@ -217,8 +209,8 @@ class SumFilter:
 
                 logging.info(f"Sending COMMIT message for req_id={req_id}")
                 self._publish([_COMMIT, req_id], self.eof_exchanges.values())
-                del self.fruit_amount[req_id]
                 
+                del self.fruit_amount[req_id]
                 return
 
         logging.info(f"Sending PREPARE message for req_id={req_id}")
