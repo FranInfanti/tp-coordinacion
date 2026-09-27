@@ -67,9 +67,10 @@ class AggregationFilter:
     def _sigterm_handler(self, signum, frame):
         logging.info("SIGTERM received, proceed with graceful shutdown...")
 
-        # stop consuming from the input exchange
         try:
             self.input_exchange.stop_consuming()
+            self.input_exchange.close()
+            self.output_queue.close()
         except Exception:
             pass
 
@@ -116,12 +117,6 @@ class AggregationFilter:
             self.input_exchange.start_consuming(self.process_message)
         except Exception as e:
             logging.error(f"Error while consuming from the exchange: {e}")
-        finally:
-            try:
-                self.input_exchange.close()
-                self.output_queue.close()
-            except:
-                pass
 
 def main():
     logging.basicConfig(level=logging.INFO)

@@ -31,6 +31,8 @@ class JoinFilter:
         # stop consuming from the input queue
         try:
             self.input_queue.stop_consuming()
+            self.input_queue.close()
+            self.output_queue.close()
         except Exception:
             pass
 
@@ -45,12 +47,6 @@ class JoinFilter:
             self.input_queue.start_consuming(self.process_messsage)
         except Exception as e:
             logging.error(f"Error while consuming from the queue: {e}")
-        finally:
-            try:
-                self.input_queue.close()
-                self.output_queue.close()
-            except:
-                pass
 
 def main():
     logging.basicConfig(level=logging.INFO)

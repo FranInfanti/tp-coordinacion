@@ -1,4 +1,5 @@
 import os
+import signal
 import hashlib
 import logging
 import threading
@@ -19,6 +20,9 @@ _DATA = 1
 _PREPARE = 2
 _OK = 3
 _COMMIT = 4
+_KILL = 5
+
+_TIMEOUT = 4.0
 
 class FruitAmount:
 
@@ -74,6 +78,40 @@ class SumFilter:
 
         self.ok_amount = {}
 
+        self.exchange_consumer = None
+
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+
+    def _sigterm_handler(self, signum, frame):
+        logging.info("SIGTERM received, proceed with graceful shutdown...")
+
+        # stop consuming from the input queue
+        try:
+            self.input_queue.stop_consuming()
+            self.input_queue.close()
+        except Exception:
+            pass
+
+        self.input_exchange.send(
+            message_protocol.internal.serialize(
+                [_KILL]
+            )
+        )
+
+        self.exchange_consumer.join(timeout=_TIMEOUT)
+
+        if self.exchange_consumer.is_alive():
+            try:
+                self.input_exchange.close()
+            except:
+                pass
+
+        for output_exchange in self.output_exchanges:
+            try:
+                output_exchange.close()
+            except:
+                pass
+
     def _get_aggregation_node(self, req_id):
         hash = hashlib.md5(str(req_id).encode()).hexdigest()
         return int(hash, 16) % AGGREGATION_AMOUNT
@@ -127,6 +165,16 @@ class SumFilter:
                 logging.info(f"Sending PREPARE for req_id={req_id}")
                 
                 self._publish([_PREPARE, req_id, ID], self.eof_exchanges.values())
+
+    def _process_kill(self):
+        try:
+            self.input_exchange.stop_consuming()
+            self.input_exchange.close()
+
+            for eof_exchange in self.eof_exchanges:
+                eof_exchange.close()
+        except Exception:
+            pass
 
     def _process_commit(self, req_id):
         logging.info(f"Process COMMIT message for req_id={req_id}")
@@ -214,16 +262,24 @@ class SumFilter:
             self._process_ok(*fields)
         elif opcode == _COMMIT:
             self._process_commit(*fields)
+        elif opcode == _KILL:
+            self._process_kill()
+            return
 
         ack()
 
     def start(self):
-        threading.Thread(
+        self.exchange_consumer = threading.Thread(
             target=self.input_exchange.start_consuming, 
             args=(self.process_message,)
-        ).start()
+        )
 
-        self.input_queue.start_consuming(self.process_message)
+        self.exchange_consumer.start()
+
+        try:
+            self.input_queue.start_consuming(self.process_message)
+        except Exception as e:
+            logging.error(f"Error while consuming from the queue: {e}")
 
 def main():
     logging.basicConfig(level=logging.INFO)
