@@ -1,7 +1,8 @@
 import os
+import signal
 import logging
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, message_protocol
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -11,7 +12,6 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
-
 
 class JoinFilter:
 
@@ -23,6 +23,17 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+
+    def _sigterm_handler(self, signum, frame):
+        logging.info("SIGTERM received, proceed with graceful shutdown...")
+
+        # stop consuming from the input queue
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
         fruit_top = message_protocol.internal.deserialize(message)
@@ -30,8 +41,16 @@ class JoinFilter:
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
-
+        try:
+            self.input_queue.start_consuming(self.process_messsage)
+        except Exception as e:
+            logging.error(f"Error while consuming from the queue: {e}")
+        finally:
+            try:
+                self.input_queue.close()
+                self.output_queue.close()
+            except:
+                pass
 
 def main():
     logging.basicConfig(level=logging.INFO)

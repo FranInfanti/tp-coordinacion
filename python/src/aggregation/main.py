@@ -1,6 +1,7 @@
 import os
-import logging
+import signal
 import bisect
+import logging
 
 from common import middleware, message_protocol, fruit_item
 
@@ -61,6 +62,17 @@ class AggregationFilter:
         self.fruit_top = {}
         self.eof_fruit_top = {}
 
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+
+    def _sigterm_handler(self, signum, frame):
+        logging.info("SIGTERM received, proceed with graceful shutdown...")
+
+        # stop consuming from the input exchange
+        try:
+            self.input_exchange.stop_consuming()
+        except Exception:
+            pass
+
     def _process_data(self, req_id, fruit, amount):
         logging.info(f"Processing DATA message for req_id={req_id}")
 
@@ -100,7 +112,16 @@ class AggregationFilter:
         ack()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_message)
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        except Exception as e:
+            logging.error(f"Error while consuming from the exchange: {e}")
+        finally:
+            try:
+                self.input_exchange.close()
+                self.output_queue.close()
+            except:
+                pass
 
 def main():
     logging.basicConfig(level=logging.INFO)
