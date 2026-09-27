@@ -88,41 +88,53 @@ class SumFilter:
         # stop consuming from the input queue
         try:
             self.input_queue.stop_consuming()
+        except Exception:
+            pass
+
+        try:
             self.input_queue.close()
         except Exception:
             pass
 
-        self.input_exchange.send(
-            message_protocol.internal.serialize(
-                [_KILL]
+        try:
+            self.input_exchange.send(
+                message_protocol.internal.serialize([_KILL])
             )
-        )
+        except Exception as error:
+            logging.warning(f"Unable to notify exchange consumer during shutdown: {error}")
 
-        self.exchange_consumer.join(timeout=_TIMEOUT)
+        if self.exchange_consumer is not None:
+            self.exchange_consumer.join(timeout=_TIMEOUT)
+            if self.exchange_consumer.is_alive():
+                logging.warning("Exchange consumer did not stop before timeout")
 
-        if self.exchange_consumer.is_alive():
+        exchanges = [self.input_exchange]
+        exchanges.extend(self.output_exchanges.values())
+        exchanges.extend(self.eof_exchanges.values())
+
+        for exchange in exchanges:
             try:
-                self.input_exchange.close()
-            except:
+                exchange.close()
+            except Exception:
                 pass
 
-        for output_exchange in self.output_exchanges:
-            try:
-                output_exchange.close()
-            except:
-                pass
-
-    def _get_aggregation_node(self, req_id):
-        hash = hashlib.md5(str(req_id).encode()).hexdigest()
+    def _get_aggregation_node(self, req_id, fruit):
+        hash = hashlib.md5(f"{req_id}:{fruit}".encode()).hexdigest()
         return int(hash, 16) % AGGREGATION_AMOUNT
 
-    def _send_data(self, req_id, amount_by_fruit):
-        logging.info(f"Sending data message for req_id={req_id}")
+    def _publish(self, message, exchanges):
+        for exchange in exchanges:
+            exchange.send(
+                message_protocol.internal.serialize(message)
+            )
 
-        i = self._get_aggregation_node(req_id)
-        data_output_exchange = self.output_exchanges[i]
+    def _send_data(self, req_id, amount_by_fruit):
+        logging.info(f"Sending DATA message for req_id={req_id}")
 
         for final_fruit_item in amount_by_fruit.values():
+            i = self._get_aggregation_node(req_id, final_fruit_item.fruit)
+            data_output_exchange = self.output_exchanges[i]
+
             data_output_exchange.send(
                 message_protocol.internal.serialize(
                     [_DATA, req_id, final_fruit_item.fruit, final_fruit_item.amount]
@@ -132,16 +144,9 @@ class SumFilter:
     def _send_eof(self, req_id):
         logging.info(f"Sending EOF message for req_id={req_id}")
 
-        i = self._get_aggregation_node(req_id)
-        self.output_exchanges[i].send(
-            message_protocol.internal.serialize([_EOF, req_id])
+        self._publish(
+            [_EOF, req_id], self.output_exchanges.values()
         )
-
-    def _publish(self, message, exchanges):
-        for exchange in exchanges:
-            exchange.send(
-                message_protocol.internal.serialize(message)
-            )
 
     def _check_req_count(self, req_id, extra_req_count):
         logging.info(f"Checking total request count for req_id={req_id}")
@@ -169,10 +174,6 @@ class SumFilter:
     def _process_kill(self):
         try:
             self.input_exchange.stop_consuming()
-            self.input_exchange.close()
-
-            for eof_exchange in self.eof_exchanges:
-                eof_exchange.close()
         except Exception:
             pass
 
@@ -180,15 +181,12 @@ class SumFilter:
         logging.info(f"Process COMMIT message for req_id={req_id}")
 
         with self.fruit_amount_lock:
-            fruit_amount = self.fruit_amount.get(req_id)
-            if not fruit_amount:
-                logging.warning(f"Amounts not found for req_id={req_id}")
-                return
+            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
 
             self._send_data(req_id, fruit_amount.amount_by_fruit)
             self._send_eof(req_id)
 
-            del self.fruit_amount[req_id]
+            self.fruit_amount.pop(req_id, None)
 
     def _process_ok(self, req_id, req_count):
         logging.info(f"Process OK message for req_id={req_id}")
@@ -230,10 +228,14 @@ class SumFilter:
 
             self.fruit_amount[req_id] = fruit_amount
 
-            # if we have already received all the data, no need to bother the other sums
             if fruit_amount.is_complete(0):
                 self._send_data(req_id, fruit_amount.amount_by_fruit)
                 self._send_eof(req_id)
+
+                logging.info(f"Sending COMMIT message for req_id={req_id}")
+                self._publish([_COMMIT, req_id], self.eof_exchanges.values())
+                del self.fruit_amount[req_id]
+                
                 return
 
         logging.info(f"Sending PREPARE message for req_id={req_id}")

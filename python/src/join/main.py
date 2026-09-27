@@ -2,7 +2,7 @@ import os
 import signal
 import logging
 
-from common import middleware, message_protocol
+from common import middleware, message_protocol, utils
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -13,6 +13,9 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
+_EOF = 0
+_DATA = 1
+
 class JoinFilter:
 
     def __init__(self):
@@ -22,6 +25,8 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+
+        self.fruit_top = {}
 
         signal.signal(signal.SIGTERM, self._sigterm_handler)
 
@@ -36,10 +41,46 @@ class JoinFilter:
         except Exception:
             pass
 
+    def _process_data(self, req_id, fruit, amount):
+        logging.info(f"Processing DATA message for req_id={req_id}")
+
+        fruit_top = self.fruit_top.get(
+            req_id, utils.FruitTop(TOP_SIZE, AGGREGATION_AMOUNT)
+        )
+        fruit_top.upsert(fruit, amount)
+
+        self.fruit_top[req_id] = fruit_top
+
+    def _process_eof(self, req_id):
+        logging.info(f"Process EOF message for req_id={req_id}")
+
+        fruit_top = self.fruit_top.get(
+            req_id, utils.FruitTop(TOP_SIZE, AGGREGATION_AMOUNT)
+        )
+        fruit_top.eof += 1
+        self.fruit_top[req_id] = fruit_top
+
+        if not fruit_top.is_complete():
+            logging.info(f"Still waiting for more DATA message for req_id={req_id}")
+            return
+
+        logging.info(f"Sending fruit top for req_id={req_id}")
+        fruit_top = fruit_top.get_top()
+        self.output_queue.send(
+            message_protocol.internal.serialize([req_id, fruit_top])
+        )
+
+        del self.fruit_top[req_id]
+
     def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        fields = message_protocol.internal.deserialize(message)
+        opcode = fields.pop(0)
+
+        if opcode == _DATA:
+            self._process_data(*fields)
+        elif opcode == _EOF:
+            self._process_eof(*fields)
+
         ack()
 
     def start(self):
@@ -52,9 +93,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
     join_filter.start()
-
     return 0
-
 
 if __name__ == "__main__":
     main()

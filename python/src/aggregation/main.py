@@ -1,9 +1,8 @@
 import os
 import signal
-import bisect
 import logging
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, message_protocol, utils
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -16,37 +15,6 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 _EOF = 0
 _DATA = 1
-
-class FruitTop:
-
-    def __init__(self):
-        self.top = []
-        self.eof = 0
-
-    def upsert(self, fruit, amount):
-        for i in range(len(self.top)):
-            if self.top[i].fruit == fruit:
-                updated_fruit = self.top[i] + fruit_item.FruitItem(fruit, amount)
-                self.top.pop(i)
-
-                bisect.insort(self.top, updated_fruit)
-                return
-
-        bisect.insort(self.top, fruit_item.FruitItem(fruit, amount))
-
-    def is_top_complete(self):
-        return self.eof == SUM_AMOUNT
-
-    def get_top(self, top_size):
-        fruit_chunk = self.top[-top_size:]
-        fruit_chunk.reverse()
-
-        return list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
 
 class AggregationFilter:
 
@@ -77,7 +45,9 @@ class AggregationFilter:
     def _process_data(self, req_id, fruit, amount):
         logging.info(f"Processing DATA message for req_id={req_id}")
 
-        fruit_top = self.fruit_top.get(req_id, FruitTop())
+        fruit_top = self.fruit_top.get(
+            req_id, utils.FruitTop(TOP_SIZE, SUM_AMOUNT)
+        )
         fruit_top.upsert(fruit, amount)
 
         self.fruit_top[req_id] = fruit_top
@@ -85,18 +55,25 @@ class AggregationFilter:
     def _process_eof(self, req_id):
         logging.info(f"Process EOF message for req_id={req_id}")
 
-        fruit_top = self.fruit_top.get(req_id, FruitTop())
+        fruit_top = self.fruit_top.get(
+            req_id, utils.FruitTop(TOP_SIZE, SUM_AMOUNT)
+        )
         fruit_top.eof += 1
-
         self.fruit_top[req_id] = fruit_top
-        if not fruit_top.is_top_complete():
+
+        if not fruit_top.is_complete():
             logging.info(f"Still waiting for more DATA message for req_id={req_id}")
             return
 
-        logging.info(f"Sending fruit top for req_id={req_id}")
-        fruit_top = fruit_top.get_top(TOP_SIZE)
+        logging.info(f"Sending DATA message with partial fruit top for req_id={req_id}")
+        for (fruit, amount) in fruit_top.get_top():
+            self.output_queue.send(
+                message_protocol.internal.serialize([_DATA, req_id, fruit, amount])
+            )
+
+        logging.info(f"Sending EOF message for req_id={req_id}")
         self.output_queue.send(
-            message_protocol.internal.serialize([req_id, fruit_top])
+            message_protocol.internal.serialize([_EOF, req_id])
         )
 
         del self.fruit_top[req_id]
