@@ -4,7 +4,7 @@ import hashlib
 import logging
 import threading
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, message_protocol, utils
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -23,23 +23,6 @@ _COMMIT = 4
 _KILL = 5
 
 _TIMEOUT = 4.0
-
-class FruitAmount:
-
-    def __init__(self):
-        self.total_req_count = None
-        self.req_count = 0
-        self.amount_by_fruit = {}
-
-    def upsert(self, fruit, amount):
-        self.req_count += 1
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
-
-    def is_complete(self, extra_req_count):
-        total_req_count = self.req_count + extra_req_count
-        return self.total_req_count is not None and total_req_count == self.total_req_count
 
 def define_exchanges(host, prefix, amount, exclude_id = None):
     exchanges = {}
@@ -181,7 +164,7 @@ class SumFilter:
         logging.info(f"Process COMMIT message for req_id={req_id}")
 
         with self.fruit_amount_lock:
-            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount = self.fruit_amount.get(req_id, utils.FruitAmount())
 
             self._send_data(req_id, fruit_amount.amount_by_fruit)
             self._send_eof(req_id)
@@ -209,7 +192,7 @@ class SumFilter:
 
         with self.fruit_amount_lock:
             # if we don't have the request, we still need to send an OK with 0 count
-            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount = self.fruit_amount.get(req_id, utils.FruitAmount())
 
             id_exchange = self.eof_exchanges.get(id)
             if not id_exchange:
@@ -223,7 +206,7 @@ class SumFilter:
         logging.info(f"Process EOF message for req_id={req_id}")
 
         with self.fruit_amount_lock:
-            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount = self.fruit_amount.get(req_id, utils.FruitAmount())
             fruit_amount.total_req_count = total_req_count
 
             self.fruit_amount[req_id] = fruit_amount
@@ -245,7 +228,7 @@ class SumFilter:
         logging.info(f"Process DATA message for req_id={req_id}")
 
         with self.fruit_amount_lock:
-            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount = self.fruit_amount.get(req_id, utils.FruitAmount())
             fruit_amount.upsert(fruit, amount)
 
             self.fruit_amount[req_id] = fruit_amount
