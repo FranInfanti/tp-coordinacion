@@ -20,21 +20,22 @@ _PREPARE = 2
 _OK = 3
 _COMMIT = 4
 
-class Amounts:
-    def __init__(self, req_id):
-        self.req_id = req_id
-        self.total_count = None
-        self.partial_count = 0
+class FruitAmount:
+
+    def __init__(self):
+        self.total_req_count = None
+        self.req_count = 0
         self.amount_by_fruit = {}
 
     def upsert(self, fruit, amount):
-        self.partial_count += 1
+        self.req_count += 1
         self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def is_complete(self, extra_count):
-        return self.total_count is not None and self.partial_count + extra_count == self.total_count
+    def is_complete(self, extra_req_count):
+        total_req_count = self.req_count + extra_req_count
+        return self.total_req_count is not None and total_req_count == self.total_req_count
 
 def define_exchanges(host, prefix, amount, exclude_id = None):
     exchanges = {}
@@ -68,10 +69,10 @@ class SumFilter:
             MOM_HOST, SUM_PREFIX, SUM_AMOUNT, exclude_id=ID
         )
 
-        self.requests = {}
-        self.requests_lock = threading.Lock()
+        self.fruit_amount = {}
+        self.fruit_amount_lock = threading.Lock()
 
-        self.ok_by_req = {}
+        self.ok_amount = {}
 
     def _get_aggregation_node(self, req_id):
         hash = hashlib.md5(str(req_id).encode()).hexdigest()
@@ -86,7 +87,7 @@ class SumFilter:
         for final_fruit_item in amount_by_fruit.values():
             data_output_exchange.send(
                 message_protocol.internal.serialize(
-                    [req_id, final_fruit_item.fruit, final_fruit_item.amount]
+                    [_DATA, req_id, final_fruit_item.fruit, final_fruit_item.amount]
                 )
             )
 
@@ -95,7 +96,7 @@ class SumFilter:
 
         i = self._get_aggregation_node(req_id)
         self.output_exchanges[i].send(
-            message_protocol.internal.serialize([req_id])
+            message_protocol.internal.serialize([_EOF, req_id])
         )
 
     def _publish(self, message, exchanges):
@@ -104,95 +105,100 @@ class SumFilter:
                 message_protocol.internal.serialize(message)
             )
 
-    def _check_total_count(self, req_id, extra_total_count):
-        logging.info(f"Checking total count for req_id={req_id}")
+    def _check_req_count(self, req_id, extra_req_count):
+        logging.info(f"Checking total request count for req_id={req_id}")
 
-        with self.requests_lock:
-            amounts = self.requests.get(req_id, Amounts(req_id))
+        with self.fruit_amount_lock:
+            fruit_amount = self.fruit_amount.get(req_id)
+            if not fruit_amount:
+                logging.error(f"Unexpected error for req_id={req_id}")
+                return   
 
-            if amounts.is_complete(extra_total_count):
-                self._send_data(req_id, amounts.amount_by_fruit)
+            if fruit_amount.is_complete(extra_req_count):
+                self._send_data(req_id, fruit_amount.amount_by_fruit)
                 self._send_eof(req_id)
 
-                logging.info(f"Sending COMMIT for req_id={req_id}")
+                logging.info(f"Sending COMMIT message for req_id={req_id}")
                 self._publish([_COMMIT, req_id], self.eof_exchanges.values())
 
-                del self.requests[req_id]
+                del self.fruit_amount[req_id]
             else:
-                logging.info(f"Total count mismatch for req_id={req_id}, expected {amounts.total_count}, got {amounts.count + extra_total_count}")
+                logging.warning(f"Total count mismatch for req_id={req_id}")
                 logging.info(f"Sending PREPARE for req_id={req_id}")
                 
                 self._publish([_PREPARE, req_id, ID], self.eof_exchanges.values())
 
     def _process_commit(self, req_id):
-        logging.info(f"Process COMMIT for req_id={req_id}")
+        logging.info(f"Process COMMIT message for req_id={req_id}")
 
-        with self.requests_lock:
-            amounts = self.requests.get(req_id)
-            if not amounts:
+        with self.fruit_amount_lock:
+            fruit_amount = self.fruit_amount.get(req_id)
+            if not fruit_amount:
                 logging.warning(f"Amounts not found for req_id={req_id}")
                 return
 
-            self._send_data(req_id, amounts.amount_by_fruit)
+            self._send_data(req_id, fruit_amount.amount_by_fruit)
             self._send_eof(req_id)
 
-            del self.requests[req_id]
+            del self.fruit_amount[req_id]
 
-    def _process_ok(self, req_id, id, count):
-        logging.info(f"Process OK for req_id={req_id}")
+    def _process_ok(self, req_id, req_count):
+        logging.info(f"Process OK message for req_id={req_id}")
 
-        ok = self.ok_by_req.get(req_id, (0, 0))
-        ok = (ok[0] + 1, ok[1] + count)
+        ok_amount = self.ok_amount.get(req_id, (0, 0))
+        ok_amount = (ok_amount[0] + 1, ok_amount[1] + req_count)
 
-        self.ok_by_req[req_id] = ok
+        self.ok_amount[req_id] = ok_amount
 
-        total_recv = ok[0]
-        total_count = ok[1]
-        if total_recv == SUM_AMOUNT - 1:
-            self._check_total_count(req_id, total_count)
-            del self.ok_by_req[req_id]
+        ok_count_recv = ok_amount[0]
+        req_count_recv = ok_amount[1]
+        if ok_count_recv == SUM_AMOUNT - 1:
+            self._check_req_count(req_id, req_count_recv)
+
+            # even if we don't send the data, we still need to erase the OK count
+            del self.ok_amount[req_id]
 
     def _process_prepare(self, req_id, id):
-        logging.info(f"Process PREPARE for req_id={req_id}")
+        logging.info(f"Process PREPARE message for req_id={req_id}")
 
-        with self.requests_lock:
+        with self.fruit_amount_lock:
             # if we don't have the request, we still need to send an OK with 0 count
-            amounts = self.requests.get(req_id, Amounts(req_id))
+            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
 
             id_exchange = self.eof_exchanges.get(id)
-            if id_exchange is None:
+            if not id_exchange:
                 logging.error(f"Exchange not found for id={id}")
                 return
 
-            logging.info(f"Sending OK for req_id={req_id} to id={id}")
-            self._publish([_OK, req_id, ID, amounts.partial_count], [id_exchange])
+            logging.info(f"Sending OK message for req_id={req_id} to id={id}")
+            self._publish([_OK, req_id, fruit_amount.req_count], [id_exchange])
 
-    def _process_eof(self, req_id, total_count):
-        logging.info(f"Process EOF for req_id={req_id}")
+    def _process_eof(self, req_id, total_req_count):
+        logging.info(f"Process EOF message for req_id={req_id}")
 
-        with self.requests_lock:
-            amounts = self.requests.get(req_id, Amounts(req_id))
-            amounts.total_count = total_count
+        with self.fruit_amount_lock:
+            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount.total_req_count = total_req_count
 
-            self.requests[req_id] = amounts
+            self.fruit_amount[req_id] = fruit_amount
 
             # if we have already received all the data, no need to bother the other sums
-            if amounts.is_complete(0):
-                self._send_data(req_id, amounts.amount_by_fruit)
+            if fruit_amount.is_complete(0):
+                self._send_data(req_id, fruit_amount.amount_by_fruit)
                 self._send_eof(req_id)
                 return
 
-        logging.info(f"Sending PREPARE for req_id={req_id}")
+        logging.info(f"Sending PREPARE message for req_id={req_id}")
         self._publish([_PREPARE, req_id, ID], self.eof_exchanges.values())
 
     def _process_data(self, req_id, fruit, amount):
-        logging.info(f"Process DATA for req_id={req_id}")
+        logging.info(f"Process DATA message for req_id={req_id}")
 
-        with self.requests_lock:
-            amounts = self.requests.get(req_id, Amounts(req_id))
-            amounts.upsert(fruit, amount)
+        with self.fruit_amount_lock:
+            fruit_amount = self.fruit_amount.get(req_id, FruitAmount())
+            fruit_amount.upsert(fruit, amount)
 
-            self.requests[req_id] = amounts
+            self.fruit_amount[req_id] = fruit_amount
 
     def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
