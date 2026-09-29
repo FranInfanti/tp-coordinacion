@@ -19,6 +19,8 @@ _DATA = 1
 class AggregationFilter:
 
     def __init__(self):
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+        
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
         )
@@ -30,17 +32,15 @@ class AggregationFilter:
         self.fruit_top = {}
         self.eof_fruit_top = {}
 
-        signal.signal(signal.SIGTERM, self._sigterm_handler)
-
     def _sigterm_handler(self, signum, frame):
         logging.info("SIGTERM received, proceed with graceful shutdown...")
 
+        self.sigterm_recv = 1
+
         try:
             self.input_exchange.stop_consuming()
-            self.input_exchange.close()
-            self.output_queue.close()
         except Exception:
-            pass
+            logging.error("Error while trying to stop consuming from the input exchange")
 
     def _process_data(self, req_id, fruit, amount):
         logging.info(f"Processing DATA message for req_id={req_id}")
@@ -93,12 +93,24 @@ class AggregationFilter:
         try:
             self.input_exchange.start_consuming(self.process_message)
         except Exception as e:
-            logging.error(f"Error while consuming from the exchange: {e}")
+            if self.sigterm_recv == 0:
+                raise e
+            else:
+                logging.info("Interrupted by SIGTERM")
+        finally:
+            self.input_exchange.close()
+            self.output_queue.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+    
+    try:
+        aggregation_filter.start()
+    except Exception as e:
+        logging.error(e)
+        return 2
+    
     return 0
 
 if __name__ == "__main__":

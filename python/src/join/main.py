@@ -19,27 +19,29 @@ _DATA = 1
 class JoinFilter:
 
     def __init__(self):
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+
+        self.sigterm_recv = 0
+
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
 
         self.fruit_top = {}
 
-        signal.signal(signal.SIGTERM, self._sigterm_handler)
-
     def _sigterm_handler(self, signum, frame):
         logging.info("SIGTERM received, proceed with graceful shutdown...")
 
-        # stop consuming from the input queue
+        self.sigterm_recv = 1
+
         try:
             self.input_queue.stop_consuming()
-            self.input_queue.close()
-            self.output_queue.close()
         except Exception:
-            pass
+            logging.error("Error while trying to stop consuming from the input queue")
 
     def _process_data(self, req_id, fruit, amount):
         logging.info(f"Processing DATA message for req_id={req_id}")
@@ -72,7 +74,7 @@ class JoinFilter:
 
         del self.fruit_top[req_id]
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         opcode = fields.pop(0)
 
@@ -85,14 +87,26 @@ class JoinFilter:
 
     def start(self):
         try:
-            self.input_queue.start_consuming(self.process_messsage)
+            self.input_queue.start_consuming(self.process_message)
         except Exception as e:
-            logging.error(f"Error while consuming from the queue: {e}")
+            if self.sigterm_recv == 0:
+                raise e
+            else:
+                logging.info("Interrupted by SIGTERM")
+        finally:
+            self.input_queue.close()
+            self.output_queue.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
-    join_filter.start()
+    
+    try:
+        join_filter.start()
+    except Exception as e:
+        logging.error(e)
+        return 2
+    
     return 0
 
 if __name__ == "__main__":

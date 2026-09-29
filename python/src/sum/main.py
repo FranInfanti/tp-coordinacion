@@ -1,3 +1,4 @@
+from math import exp
 import os
 import signal
 import hashlib
@@ -40,11 +41,19 @@ def define_exchanges(host, prefix, amount, exclude_id = None):
 class SumFilter:
 
     def __init__(self):
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+
+        self.sigterm_recv = 0
+        
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
 
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{ID}"]
+        )
+
+        self.kill_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{ID}"]
         )
 
@@ -63,35 +72,21 @@ class SumFilter:
 
         self.exchange_consumer = None
 
-        signal.signal(signal.SIGTERM, self._sigterm_handler)
-
     def _sigterm_handler(self, signum, frame):
         logging.info("SIGTERM received, proceed with graceful shutdown...")
+        self.sigterm_recv = 1
+
+        try:
+            self.kill_exchange.send(
+                message_protocol.internal.serialize([_KILL])
+            )
+        except Exception:
+            logging.error("Fail to send the KILL message")
 
         try:
             self.input_queue.stop_consuming()
-            self.input_queue.close()
         except Exception:
-            pass
-
-        self.input_exchange.send(
-            message_protocol.internal.serialize([_KILL])
-        )
-
-        if self.exchange_consumer:
-            self.exchange_consumer.join(timeout=_TIMEOUT)
-            if self.exchange_consumer.is_alive():
-                logging.warning("Exchange consumer did not stop before timeout")
-
-        exchanges = [self.input_exchange]
-        exchanges.extend(self.output_exchanges.values())
-        exchanges.extend(self.eof_exchanges.values())
-
-        for exchange in exchanges:
-            try:
-                exchange.close()
-            except Exception:
-                pass
+            logging.error("Error while trying to stop consuming from the input queue")
 
     def _get_aggregation_node(self, req_id, fruit):
         hash = hashlib.md5(f"{req_id}:{fruit}".encode()).hexdigest()
@@ -241,27 +236,55 @@ class SumFilter:
             self._process_commit(*fields)
         elif opcode == _KILL:
             self._process_kill()
-            return
 
         ack()
 
+    def _consume_exchange(self):
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        except Exception:
+            if self.sigterm_recv == 0:
+                raise
+            logging.info("Interrupted by SIGTERM")
+
     def start(self):
         self.exchange_consumer = threading.Thread(
-            target=self.input_exchange.start_consuming, 
-            args=(self.process_message,)
+            target=self._consume_exchange,
+            daemon=True
         )
 
         self.exchange_consumer.start()
 
         try:
             self.input_queue.start_consuming(self.process_message)
-        except Exception as e:
-            logging.error(f"Error while consuming from the queue: {e}")
+        except Exception:
+            if self.sigterm_recv == 0:
+                raise
+            logging.info("Interrupted by SIGTERM")
+        finally:
+            if self.exchange_consumer:
+                self.exchange_consumer.join(timeout=_TIMEOUT)
+
+            exchanges = [self.input_exchange, self.kill_exchange, self.input_queue]
+            exchanges.extend(self.output_exchanges.values())
+            exchanges.extend(self.eof_exchanges.values())
+            
+            for exchange in exchanges:
+                try:
+                    exchange.close()
+                except Exception:
+                    pass
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    
+    try:
+        sum_filter.start()
+    except Exception as e:
+        logging.error(e)
+        return 2
+    
     return 0
 
 if __name__ == "__main__":
