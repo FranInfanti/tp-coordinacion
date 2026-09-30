@@ -1,5 +1,3 @@
-Redactar un breve informe en el archivo `INFORME.md` explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes, grándes volúmens de datos y la cantidad de controles.
-
 ## Tabla de contenidos
 
 1. [Identificación de peticiones](#identificación-de-peticiones)
@@ -60,7 +58,7 @@ Entonces, el procedimiento a seguir es el siguiente:
 
 Para enviar los datos hacia instancias de _aggregation_ se utiliza un _exchange_, cada instancia de _aggregation_ escucha los mensajes que llegan a ese _exchange_ y tienen como _routing key_ el _id_ de la instancia, que es conocido por las instancias de _sum_.
 
-Entonces para que una instancia de _sum_ determine a que instancia de _aggregation_ debe enviar los mensaje `DATA`, se calcula un _hash_ por cada `req_id`:`fruit` y se aplica el operador `%` para determinar el número de instancia de _aggregation_, que corresponde con el _id_ y que corresponde con la _routing key_ a utilizar.
+Entonces para que una instancia de _sum_ determine a que instancia de _aggregation_ debe enviar los mensaje `DATA`, se calcula un _hash_ por cada `{req_id}:{fruit}` y se aplica el operador `%` para determinar el número de instancia de _aggregation_, que corresponde con el _id_ y que corresponde con la _routing key_ a utilizar.
 
 De esta forma cada mensaje `DATA` va a parar a una instancia de _aggregation_ diferente, ahora cuando una instancia de _sum_ termina de enviar sus datos, como no sabe a que instancias de _aggregation_ los recibieron, publica en el _exchange_ el mensaje `EOF` para que lo reciban todas las instancias de _aggregation_, independientemente de si procesaron o no datos.
 
@@ -72,3 +70,23 @@ Entonces, cada instancia de _aggregation_ cuando reciba un `EOF`, debe verificar
 Para enviar los datos hacia la instancia de _join_ se utiliza una única _queue_, entonces cada instancia de _aggregation_ lo que va a hacer es enviar su `TOP_SIZE` local, que se van a ir agrupando en la instancia de _join_ y combinando para determinar el top final. Luego, cuando la instancia de _join_ reciba los `AGGREGATION_AMOUNT` mensajes `EOF`, determina el `TOP_SIZE` definitivo y lo envia por una _queue_ hacia la instancia de _gateway_.
 
 ## Escalabilidad
+
+A continuación voy a explicar que pasa cuando el sistema escala en cantidad de clientes y volumen de datos, o solamente en clientes, o solamente en volumen de datos.
+
+Sabemos que la instancia de _gateway_ va depositando los mensajes de los clientes en una _queue_ de la cual van consumiendo las `SUM_AMOUNT` instancias de _sum_. 
+
+Independientemente de si aumenta la cantidad de clientes o el volumen de datos, o ambos, el _gateway_ va a ir enviando cada vez mas mensajes a esa _queue_. Entonces, si las instancias de _sum_ no son las suficientes o no son lo suficientemente rapidos, hay un riesgo de sufrir un _overflow_. Luego lo que podemos hacer es aumentar la cantidad de instancias de _sum_, de esta forma vamos a poder procesar mas datos en paralelo, ya que para el procesamiento las instancias son independientes. 
+
+Sin embargo, al aumentar la cantidad de instancias de _sum_ se aumenta la cantidad de instancias a coordinar cuando se reciba el mensaje `EOF`, ya que la _instancia coordinadora_ debera enviar y esperar a mas mensajes. Entonces no podemos añadir tantas instancias de _sum_ como querramos sin tener una consecuencia, que viene siendo a ser el tiempo que se va a tardar en coordinar a estas instancias.
+
+Por otro lado, dado que las instancias de _sum_ realizan la operación `hash({req_id}:{fruit}) % AGGREGATION_AMOUNT` para determinar la instancia de _aggregation_, y de esta forma distribuir la carga. Veamos que en este caso no basta con aumentar indefinidamente la cantida de instancias, que en este caso al no haber sincronización entre ellas, no habria problemas.
+
+Si tenemos muchos clientes y pocos datos (mucha o poca variedad de `fruit`), `req_id` va a tomar muchos valores, entonces el hash va a dar valores distintos, lo que va a permitir distribuir la carga entre las instancias de _aggregation_, evitando que haya instancias ociosas. Lo mismo ocurre si hay pocos clientes, pero muchos datos de distinto tipo, en este caso `fruit` va a tomar muchos valores.
+
+Pero el problema esta cuando hay pocos clientes y muchos datos similares (poca variedad de `fruit`), entonces el hash no va a variar tanto y no se va a distribuir tanto la carga. 
+
+Dado estas situaciones, se deberia analizar que tipo de _key_ conviene para tratar de minimizar estos casos, porque es poco probable que encontremos la _key_ que funciona a la perfección para cada uno de los casos.
+
+Ahora, el cuello de botella principal se encuentra en la única instancia de _join_, todo el trabajo que logramos paralelizar en las instancias posteriores, va a terminar cayendo en una única instancia que va a tener que combinar todos los resultados que le envien las `AGGREGATION_AMOUNT` instancias de _aggregation_, que si son muchas, entonces se va a tener que esperar mas tiempo hasta recibir el resultado de cada una. Y como la instancia de _join_ consume de una _queue_, y procesa de forma secuencial, esta _queue_ es mas propensa a sufrir un _overflow_.
+
+Se podrian poner mas instancias de _join_ y remplazar la _queue_ por un _exchange_, donde cada instancia de _join_ escucha los mensajes con _routing key_ igual a su _id_. Entonces las instancias de _aggregation_ podrian hashear en base al `req_id` para determinar la instancia de _join_. Sin embargo, esto es útil cuando escala la cantidad de clientes, pero cuando escala solamente el volumen de datos, vamos a tener el problema de que algunas instancias van a estar sobrecargadas de trabajo y otras no.
