@@ -220,6 +220,14 @@ class SumFilter:
 
             self.fruit_amount[req_id] = fruit_amount
 
+    def _consume_exchange(self):
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        except Exception:
+            if self.sigterm_recv == 0:
+                raise
+            logging.info("Interrupted by SIGTERM")
+
     def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         opcode = fields.pop(0)
@@ -238,14 +246,6 @@ class SumFilter:
             self._process_kill()
 
         ack()
-
-    def _consume_exchange(self):
-        try:
-            self.input_exchange.start_consuming(self.process_message)
-        except Exception:
-            if self.sigterm_recv == 0:
-                raise
-            logging.info("Interrupted by SIGTERM")
 
     def start(self):
         self.exchange_consumer = threading.Thread(
